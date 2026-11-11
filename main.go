@@ -30,11 +30,11 @@ type MergeInfo struct {
 }
 
 type CheckResult struct {
-	fileName             string
-	countMismatch        []string // "第X行"
-	mergeLeak            []string // "第X行"
-	dupRefDes            map[string][]int // key:位号 value:行号数组
-	dupPartNo            map[string][]int // key:料号 value:行号数组
+	fileName      string
+	countMismatch []string // "第X行"
+	mergeLeak     []string // "第X行"
+	dupRefDes     map[string][]int // key:位号 value:行号数组
+	dupPartNo     map[string][]int // key:料号 value:行号数组
 }
 
 // 分割位号：中文逗号，英文逗号，文字“和”
@@ -124,9 +124,9 @@ func processFile(path string) (*CheckResult, error) {
 		return nil, err
 	}
 	res := &CheckResult{
-		fileName:      filepath.Base(path),
-		dupRefDes:     make(map[string][]int),
-		dupPartNo:     make(map[string][]int),
+		fileName:  filepath.Base(path),
+		dupRefDes: make(map[string][]int),
+		dupPartNo: make(map[string][]int),
 	}
 
 	partNoMap := make(map[string][]int)
@@ -148,7 +148,6 @@ func processFile(path string) (*CheckResult, error) {
 			aVal = strings.TrimSpace(row[0])
 		}
 
-		// =========关键修复=========
 		// E、F列：如果是合并单元格，自动取合并块首行的值
 		eVal, errE := getMergedCellValue(f, sheet, excelRow, colE, mergeCellMap)
 		if errE != nil {
@@ -161,7 +160,6 @@ func processFile(path string) (*CheckResult, error) {
 			fVal = ""
 		}
 		fVal = strings.TrimSpace(fVal)
-		// ==========================
 
 		// 料号重复检查
 		if aVal != "" {
@@ -192,22 +190,46 @@ func processFile(path string) (*CheckResult, error) {
 			refDesAll[rd] = append(refDesAll[rd], excelRow)
 		}
 
-		// 漏合并检测：只针对非合并行；合并块内部行不再做漏合并判断
+		// ============修复漏合并检测逻辑============
 		if rowIdx+1 < maxRow {
-			nextRow := rows[rowIdx+1]
+			nextRowIdx := rowIdx + 1
+			nextExcelRow := nextRowIdx + 1
+
+			nextRow := rows[nextRowIdx]
 			nextA := ""
 			if len(nextRow) > 0 {
 				nextA = strings.TrimSpace(nextRow[0])
 			}
-			efHasData := eVal != "" || fVal != ""
-			nextAHas := nextA != ""
 
-			// 当前E单元格不在合并，F单元格不在合并；并且本行不是合并从属子行
-			keyF := fmt.Sprintf("%d-%d", excelRow, colF)
-			_, eInMerge := mergeCellMap[keyE]
-			_, fInMerge := mergeCellMap[keyF]
+			nextEVal, errNE := getMergedCellValue(f, sheet, nextExcelRow, colE, mergeCellMap)
+			if errNE != nil {
+				nextEVal = ""
+			}
+			nextEVal = strings.TrimSpace(nextEVal)
 
-			if efHasData && nextAHas && !eInMerge && !fInMerge {
+			nextFVal, errNF := getMergedCellValue(f, sheet, nextExcelRow, colF, mergeCellMap)
+			if errNF != nil {
+				nextFVal = ""
+			}
+			nextFVal = strings.TrimSpace(nextFVal)
+
+			keyNextE := fmt.Sprintf("%d-%d", nextExcelRow, colE)
+			keyNextF := fmt.Sprintf("%d-%d", nextExcelRow, colF)
+			nextEIsMerged := false
+			if _, ok := mergeCellMap[keyNextE]; ok {
+				nextEIsMerged = true
+			}
+			nextFIsMerged := false
+			if _, ok := mergeCellMap[keyNextF]; ok {
+				nextFIsMerged = true
+			}
+
+			curEFHasData := eVal != "" || fVal != ""
+			nextAHasData := nextA != ""
+			nextEFAllEmpty := (nextEVal == "") && (nextFVal == "")
+			nextEFNotCover := (!nextEIsMerged) || (!nextFIsMerged)
+
+			if curEFHasData && nextAHasData && nextEFAllEmpty && nextEFNotCover {
 				res.mergeLeak = append(res.mergeLeak, fmt.Sprintf("%d", excelRow))
 			}
 		}
