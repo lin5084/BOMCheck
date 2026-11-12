@@ -3,7 +3,7 @@ name: Build BOMCheck Windows EXE
 on:
   #push:
    # branches: [ main ]
-  workflow_dispatch: # 支持网页手动点按钮编译
+ # workflow_dispatch: # 支持网页手动点按钮编译
 
 jobs:
   build-windows:
