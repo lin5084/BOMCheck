@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/xuri/excelize/v2"
@@ -31,10 +32,11 @@ type MergeInfo struct {
 
 type CheckResult struct {
 	fileName      string
-	countMismatch []string // "第X行"
-	mergeLeak     []string // "第X行"
-	dupRefDes     map[string][]int // key:位号 value:行号数组
+	countMismatch []string         // "第X行"
+	mergeLeak     []string         // "第X行"
+	dupRefDes     map[string][]int // key:位号 value:行号数组（按出现次数记录）
 	dupPartNo     map[string][]int // key:料号 value:行号数组
+	unparsed      int              // 组件数量非数字、已跳过比对的次数
 }
 
 // 分割位号：中文逗号，英文逗号，文字“和”
@@ -55,7 +57,32 @@ func splitRefDes(s string) []string {
 	return res
 }
 
-// 获取合并单元格完整信息，返回每个合并块；再建立map：row-col → *MergeInfo
+// parseQty 解析组件数量：支持 2、2.0、全角数字２、文本型"2"
+func parseQty(s string) (int, bool) {
+	s = strings.TrimSpace(s)
+	var b strings.Builder
+	for _, r := range s {
+		if r >= '０' && r <= '９' {
+			b.WriteRune(r - '０' + '0')
+		} else {
+			b.WriteRune(r)
+		}
+	}
+	s = strings.TrimSpace(b.String())
+
+	if n, err := strconv.Atoi(s); err == nil && n >= 0 {
+		return n, true
+	}
+	if v, err := strconv.ParseFloat(s, 64); err == nil {
+		n := int(v)
+		if float64(n) == v && n >= 0 {
+			return n, true
+		}
+	}
+	return 0, false
+}
+
+// 获取合并单元格完整信息，返回合并块map：row-col → *MergeInfo
 func getMergeMap(f *excelize.File, sheet string) (map[string]*MergeInfo, []MergeInfo, error) {
 	mergeCellMap := make(map[string]*MergeInfo)
 	var mergeList []MergeInfo
@@ -90,12 +117,19 @@ func getMergedCellValue(f *excelize.File, sheet string, row int, col int, mergeC
 	mi, ok := mergeCellMap[key]
 	cellAxis, _ := excelize.CoordinatesToCellName(col, row)
 	if !ok {
-		// 非合并单元格，直接取值
 		return f.GetCellValue(sheet, cellAxis)
 	}
-	// 是合并单元格，取合并起始单元格
 	firstAxis, _ := excelize.CoordinatesToCellName(mi.startCol, mi.startRow)
 	return f.GetCellValue(sheet, firstAxis)
+}
+
+// isMergeSubRow 判断某单元格是否是合并块里的“从属子行”（不是合并首行）
+func isMergeSubRow(mergeCellMap map[string]*MergeInfo, row, col int) bool {
+	mi, ok := mergeCellMap[fmt.Sprintf("%d-%d", row, col)]
+	if !ok {
+		return false
+	}
+	return mi.startRow != row
 }
 
 func processFile(path string) (*CheckResult, error) {
@@ -110,7 +144,7 @@ func processFile(path string) (*CheckResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	if a1 != "料号" {
+	if strings.TrimSpace(a1) != "料号" {
 		return nil, fmt.Errorf("not bom")
 	}
 
@@ -134,6 +168,7 @@ func processFile(path string) (*CheckResult, error) {
 
 	maxRow := len(rows)
 	// E=5列，F=6列（excel列号，A=1）
+	const colA = 1
 	const colE = 5
 	const colF = 6
 
@@ -141,14 +176,13 @@ func processFile(path string) (*CheckResult, error) {
 	for rowIdx := 3; rowIdx < maxRow; rowIdx++ {
 		excelRow := rowIdx + 1
 
-		// A列直接拿原始行数据
 		row := rows[rowIdx]
 		aVal := ""
 		if 0 < len(row) {
 			aVal = strings.TrimSpace(row[0])
 		}
 
-		// E、F列：如果是合并单元格，自动取合并块首行的值
+		// E、F列：如果是合并单元格，取合并块首行的值
 		eVal, errE := getMergedCellValue(f, sheet, excelRow, colE, mergeCellMap)
 		if errE != nil {
 			eVal = ""
@@ -161,36 +195,36 @@ func processFile(path string) (*CheckResult, error) {
 		}
 		fVal = strings.TrimSpace(fVal)
 
-		// 料号重复检查
-		if aVal != "" {
+		// 是否为合并块的从属子行
+		subA := isMergeSubRow(mergeCellMap, excelRow, colA)
+		subE := isMergeSubRow(mergeCellMap, excelRow, colE)
+		subF := isMergeSubRow(mergeCellMap, excelRow, colF)
+
+		// 料号重复：合并块只在首行计一次
+		if aVal != "" && !subA {
 			partNoMap[aVal] = append(partNoMap[aVal], excelRow)
 		}
 
 		refList := splitRefDes(fVal)
-		var eNum int
-		_, _ = fmt.Sscanf(eVal, "%d", &eNum)
 
-		// 判断：本行是合并块的非首行，则跳过【组件数量 vs 位号数量校验】
-		isMergeSubRow := false
-		keyE := fmt.Sprintf("%d-%d", excelRow, colE)
-		if mi, ok := mergeCellMap[keyE]; ok && mi.startRow != excelRow {
-			isMergeSubRow = true
+		// 位号重复：合并块只在首行计一次，否则一个合并块会被重复计数
+		if !subF {
+			for _, rd := range refList {
+				refDesAll[rd] = append(refDesAll[rd], excelRow)
+			}
 		}
 
-		// 只有合并首行 / 非合并单元格才做数量比对；合并内部子行跳过，不再误报
-		if !isMergeSubRow && eVal != "" {
-			realCnt := len(refList)
-			if realCnt != eNum {
+		// 组件数量 vs 位号数量：合并块子行不参与比对（首行已代表整块）
+		if !subE && !subF && eVal != "" {
+			qty, ok := parseQty(eVal)
+			if !ok {
+				res.unparsed++
+			} else if len(refList) != qty {
 				res.countMismatch = append(res.countMismatch, fmt.Sprintf("%d", excelRow))
 			}
 		}
 
-		// 收集位号重复
-		for _, rd := range refList {
-			refDesAll[rd] = append(refDesAll[rd], excelRow)
-		}
-
-		// ============修复漏合并检测逻辑============
+		// 漏合并检测：当前行(R)E/F有数据；下一行(R+1)A有料号；下一行E/F都为空；且下一行E/F没有被合并覆盖
 		if rowIdx+1 < maxRow {
 			nextRowIdx := rowIdx + 1
 			nextExcelRow := nextRowIdx + 1
@@ -213,23 +247,16 @@ func processFile(path string) (*CheckResult, error) {
 			}
 			nextFVal = strings.TrimSpace(nextFVal)
 
-			keyNextE := fmt.Sprintf("%d-%d", nextExcelRow, colE)
-			keyNextF := fmt.Sprintf("%d-%d", nextExcelRow, colF)
-			nextEIsMerged := false
-			if _, ok := mergeCellMap[keyNextE]; ok {
-				nextEIsMerged = true
-			}
-			nextFIsMerged := false
-			if _, ok := mergeCellMap[keyNextF]; ok {
-				nextFIsMerged = true
-			}
+			_, nextEIsMerged := mergeCellMap[fmt.Sprintf("%d-%d", nextExcelRow, colE)]
+			_, nextFIsMerged := mergeCellMap[fmt.Sprintf("%d-%d", nextExcelRow, colF)]
 
 			curEFHasData := eVal != "" || fVal != ""
 			nextAHasData := nextA != ""
 			nextEFAllEmpty := (nextEVal == "") && (nextFVal == "")
 			nextEFNotCover := (!nextEIsMerged) || (!nextFIsMerged)
 
-			if curEFHasData && nextAHasData && nextEFAllEmpty && nextEFNotCover {
+			// 当前行本身是合并块子行时，已经由块首行代表，不再重复判定
+			if curEFHasData && nextAHasData && nextEFAllEmpty && nextEFNotCover && !subE && !subF {
 				res.mergeLeak = append(res.mergeLeak, fmt.Sprintf("%d", excelRow))
 			}
 		}
@@ -237,11 +264,11 @@ func processFile(path string) (*CheckResult, error) {
 
 	// 重复料号输出
 	for pn, rowsArr := range partNoMap {
-		if len(rowsArr) > 1 {
+		if len(dedupInts(rowsArr)) > 1 {
 			res.dupPartNo[pn] = rowsArr
 		}
 	}
-	// 重复位号输出
+	// 重复位号输出（按出现次数判断，同一行内写两次也算重复）
 	for rd, rowsArr := range refDesAll {
 		if len(rowsArr) > 1 {
 			res.dupRefDes[rd] = rowsArr
@@ -251,9 +278,31 @@ func processFile(path string) (*CheckResult, error) {
 	return res, nil
 }
 
+func dedupInts(in []int) []int {
+	seen := map[int]bool{}
+	var out []int
+	for _, v := range in {
+		if !seen[v] {
+			seen[v] = true
+			out = append(out, v)
+		}
+	}
+	sort.Ints(out)
+	return out
+}
+
+func joinRows(rows []int) string {
+	rows = dedupInts(rows)
+	var strs []string
+	for _, v := range rows {
+		strs = append(strs, fmt.Sprintf("%d", v))
+	}
+	return strings.Join(strs, "、")
+}
+
 func main() {
 	workDir := "."
-	if len(os.Args) > 1 {
+	if len(os.Args) > 1 && !strings.HasPrefix(os.Args[1], "-") {
 		workDir = os.Args[1]
 	}
 
@@ -276,6 +325,7 @@ func main() {
 		}
 		return nil
 	})
+	sort.Strings(bomFiles)
 
 	var results []*CheckResult
 	for _, fpath := range bomFiles {
@@ -288,7 +338,7 @@ func main() {
 
 	if len(results) == 0 {
 		fmt.Println("当前文件夹下无BOM格式文件。")
-		fmt.Println("按回车键退出...")
+		fmt.Print("按回车键退出...")
 		_, _ = os.Stdin.Read(make([]byte, 1))
 		return
 	}
@@ -312,12 +362,7 @@ func main() {
 		}
 		sort.Strings(dupRefList)
 		for _, rd := range dupRefList {
-			rows := res.dupRefDes[rd]
-			var strs []string
-			for _, v := range rows {
-				strs = append(strs, fmt.Sprintf("%d", v))
-			}
-			fmt.Printf("%s 中的位号 %s 出现重复（出现在第 %s 行）。\n", res.fileName, rd, strings.Join(strs, "、"))
+			fmt.Printf("%s 中的位号 %s 出现重复（出现在第 %s 行）。\n", res.fileName, rd, joinRows(res.dupRefDes[rd]))
 			totalErr++
 		}
 		// 重复料号
@@ -327,17 +372,21 @@ func main() {
 		}
 		sort.Strings(dupPartList)
 		for _, pn := range dupPartList {
-			rows := res.dupPartNo[pn]
-			var strs []string
-			for _, v := range rows {
-				strs = append(strs, fmt.Sprintf("%d", v))
-			}
-			fmt.Printf("%s 中的料号 %s 出现重复（出现在第 %s 行）。\n", res.fileName, pn, strings.Join(strs, "、"))
+			fmt.Printf("%s 中的料号 %s 出现重复（出现在第 %s 行）。\n", res.fileName, pn, joinRows(res.dupPartNo[pn]))
 			totalErr++
+		}
+		// 非数字数量提示（不算告警）
+		if res.unparsed > 0 {
+			fmt.Printf("【提示】%s 中有 %d 行的组件数量不是数字，已跳过该行的数量比对。\n", res.fileName, res.unparsed)
+			totalErr += 0
 		}
 	}
 
-	fmt.Printf("\n检测完成，共扫描 %d 个BOM文件，发现 %d 个告警。\n", len(results), totalErr)
-	fmt.Println("按回车键退出...")
+	if totalErr == 0 {
+		fmt.Printf("\n检测完成，共扫描 %d 个BOM文件，未发现问题。\n", len(results))
+	} else {
+		fmt.Printf("\n检测完成，共扫描 %d 个BOM文件，发现 %d 个告警。\n", len(results), totalErr)
+	}
+	fmt.Print("按回车键退出...")
 	_, _ = os.Stdin.Read(make([]byte, 1))
 }
