@@ -305,7 +305,7 @@ func main() {
 	if len(os.Args) > 1 && !strings.HasPrefix(os.Args[1], "-") {
 		workDir = os.Args[1]
 	}
-
+	fmt.Print("\n此程序可以检查的事项如下：\n1.位号是否重复\n2.料号是否重复\n3.组件数量和位号实际数量是否一致\n4.合并单元格是否遗漏\n")
 	fmt.Printf("BOM 检查目录：%s\n\n", workDir)
 
 	var bomFiles []string
